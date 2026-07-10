@@ -16,13 +16,11 @@ use std::{
     path::Path,
 };
 
-use id3::Tag;
-
 use crate::{
     asset_handlers::id3_helper::{self, ID3V2Header},
     asset_io::{
-        AssetIO, AssetPatch, CAIRead, CAIReadWrapper, CAIReadWrite, CAIReader, CAIWriter,
-        HashObjectPositions, RemoteRefEmbed, RemoteRefEmbedType,
+        AssetIO, AssetPatch, CAIRead, CAIReadWrite, CAIReader, CAIWriter, HashObjectPositions,
+        RemoteRefEmbed, RemoteRefEmbedType,
     },
     error::{Error, Result},
 };
@@ -119,10 +117,7 @@ impl CAIReader for FlacIO {
 
         if let Some(h) = header {
             let mut manifest: Option<Vec<u8>> = None;
-            let reader = CAIReadWrapper {
-                reader: input_stream,
-            };
-            if let Ok(tag) = Tag::read_from2(reader) {
+            if let Some(tag) = id3_helper::read_tag_safely(input_stream) {
                 for eo in tag.encapsulated_objects() {
                     if id3_helper::is_c2pa_mime_type(&eo.mime_type) {
                         match &manifest {

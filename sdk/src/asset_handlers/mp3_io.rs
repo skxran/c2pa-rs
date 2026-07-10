@@ -13,8 +13,6 @@
 
 use std::{io::Cursor, path::Path};
 
-use id3::Tag;
-
 use crate::{
     asset_handlers::id3_helper::{self, ID3V2Header},
     asset_io::{
@@ -87,7 +85,7 @@ impl CAIReader for Mp3IO {
     fn read_cai(&self, input_stream: &mut dyn CAIRead) -> Result<Vec<u8>> {
         input_stream.rewind()?;
         let mut manifest: Option<Vec<u8>> = None;
-        if let Ok(tag) = Tag::read_from2(input_stream) {
+        if let Some(tag) = id3_helper::read_tag_safely(input_stream) {
             for eo in tag.encapsulated_objects() {
                 if id3_helper::is_c2pa_mime_type(&eo.mime_type) {
                     match manifest {
@@ -426,5 +424,56 @@ pub mod tests {
             Err(Error::UnsupportedType) => {}
             other => panic!("expected UnsupportedType for ID3v1 header, got {:?}", other),
         }
+    }
+
+    /// Regression using the researcher-supplied PoC file
+    /// [`id3v23_compression_underflow.mp3`]: a 445-byte MP3 whose ID3v2.3 tag
+    /// contains a single `TIT2` frame with `content_size = 3` and format
+    /// flag `0x80` (COMPRESSION). Pre-fix the `id3` crate would execute
+    /// `content_size - 4` on a `usize`, wrap to ~u64::MAX, and abort the
+    /// process on the subsequent `vec![0; read_size]` allocation. Post-fix
+    /// the pre-validator rejects the frame table and both the read and
+    /// write paths surface as clean errors instead of crashing.
+    #[test]
+    fn test_id3v23_compression_underflow_fixture_read_does_not_crash() {
+        let mp3_io = Mp3IO::new("mp3");
+        // Load into memory rather than opening the file so the test does
+        // not depend on filesystem state during the read.
+        let bytes = std::fs::read(fixture_path("id3v23_compression_underflow.mp3"))
+            .expect("PoC fixture must be present");
+        assert_eq!(
+            bytes.len(),
+            445,
+            "PoC fixture size must match the reported CVE payload"
+        );
+        let mut cursor = Cursor::new(bytes);
+
+        // Must not crash. The malicious frame is dropped by the validator,
+        // so no C2PA GEOB is found and the result is JumbfNotFound.
+        match mp3_io.read_cai(&mut cursor) {
+            Err(Error::JumbfNotFound) => {}
+            other => panic!(
+                "expected JumbfNotFound for underflow PoC fixture, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_id3v23_compression_underflow_fixture_write_does_not_crash() {
+        let mp3_io = Mp3IO::new("mp3");
+        let bytes = std::fs::read(fixture_path("id3v23_compression_underflow.mp3"))
+            .expect("PoC fixture must be present");
+        let mut input = Cursor::new(bytes);
+        let mut output = Cursor::new(Vec::new());
+        // The reported CVE was "crashes when signing" — exercise the write
+        // path with a small store-bytes payload. Must not crash; must either
+        // succeed (a fresh tag is written, ignoring the malicious frame) or
+        // return a normal Error variant.
+        let result = mp3_io.write_cai(&mut input, &mut output, &[1, 2, 3, 4]);
+        assert!(
+            result.is_ok() || matches!(result, Err(Error::InvalidAsset(_))),
+            "unexpected result on underflow PoC fixture write path: {result:?}",
+        );
     }
 }
