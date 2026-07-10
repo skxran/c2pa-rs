@@ -834,6 +834,7 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     #![allow(clippy::unwrap_used)]
 
     use std::io::Cursor;
