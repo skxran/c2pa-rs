@@ -20,7 +20,7 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{Cursor, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -112,31 +112,73 @@ pub(crate) fn is_c2pa_mime_type(mime_type: &str) -> bool {
     mime_type == GEOB_FRAME_MIME_TYPE || mime_type == GEOB_FRAME_MIME_TYPE_DEPRECATED
 }
 
-/// Streaming pre-validator for ID3v2.3 frame tables.
+/// Reverses ID3v2 unsynchronisation: drops any `0x00` byte that immediately
+/// follows a `0xFF` byte, matching `id3`'s `stream::unsynch::Reader`.
 ///
-/// Walks each 10-byte frame header inside the tag body and rejects any
-/// frame that declares the COMPRESSION format flag together with a body
-/// size less than 4 bytes. The `id3` crate through the current pin
-/// (v1.17.0, verified against `src/stream/frame/v3.rs:51`) unconditionally
-/// executes `content_size - 4` on a `usize` in that case, wrapping to
-/// ~u64::MAX and aborting the process on the subsequent
-/// `vec![0; read_size]` with "capacity overflow".
+/// A tag sets the unsynchronisation flag so that no `0xFF 0x00`/`0xFF 0xEx`
+/// pattern (which hardware could mistake for an MPEG sync word) appears in the
+/// body. To read the real frame sizes we must reverse it first.
+fn decode_unsynch(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut prev_was_ff = false;
+    for &byte in data {
+        if prev_was_ff && byte == 0x00 {
+            prev_was_ff = false;
+            continue;
+        }
+        out.push(byte);
+        prev_was_ff = byte == 0xff;
+    }
+    out
+}
+
+/// Returns `true` if a 10-byte ID3v2.3 frame header declares the COMPRESSION
+/// format flag together with a body smaller than the 4-byte decompressed-size
+/// prefix.
 ///
-/// ID3v2.2 has no compression flag, and ID3v2.4 already uses
-/// `saturating_sub` upstream in `src/stream/frame/v4.rs`, so this guard
-/// only needs to fire for v2.3.
+/// That is the `content_size - 4` underflow the `id3` crate performs at
+/// `src/stream/frame/v3.rs:50`, which wraps to ~u64::MAX and aborts the process
+/// on the following `vec![0; read_size]` ("capacity overflow"). Per ID3v2.3
+/// §3.3.1 the COMPRESSION bit is `0x80` of the second format-flags byte and the
+/// frame size is a raw big-endian `u32`.
+fn id3v2_3_frame_underflows(frame_hdr: &[u8; 10]) -> bool {
+    let content_size = u32::from_be_bytes([frame_hdr[4], frame_hdr[5], frame_hdr[6], frame_hdr[7]]);
+    (frame_hdr[9] & 0x80) != 0 && content_size < 4
+}
+
+/// Pre-validator for ID3v2.3 frame tables.
 ///
-/// The validator only reads 10-byte frame headers and seeks past bodies,
-/// so no attacker-controlled allocation happens here.
+/// Walks each 10-byte frame header inside the tag body and rejects any frame
+/// that would trigger the compressed-frame underflow described in
+/// [`id3v2_3_frame_underflows`].
 ///
-/// * `reader` must be positioned at the start of the tag body (just after
-///   the 10-byte ID3 tag header).
-/// * `tag_size` is the tag body length (decoded from the synchsafe field
-///   by [`ID3V2Header::decode_tag_size`]).
+/// To inspect the same frame bytes the `id3` crate decodes, this mirrors the
+/// crate's handling (v1.17.0, `src/stream/tag.rs`) of the two ID3v2.3
+/// tag-header flags that move or reshape the frame region:
+///
+/// * **Extended header** (tag flag `0x40`): the crate reads and skips it before
+///   parsing frames, using a synchsafe-decoded size. We seek past the same span.
+/// * **Unsynchronisation** (tag flag `0x80`): the crate de-unsynchronises the
+///   frame bytes before parsing. We de-unsynchronise the frame region into a
+///   buffer and walk that, so the sizes and flags we inspect match what the
+///   crate will actually decode. Without this, a crafted tag could set either
+///   flag to misalign a naive raw walk and slip a malicious frame through.
+///
+/// ID3v2.2 has no compression flag and ID3v2.4 uses `saturating_sub` upstream,
+/// so this guard is only needed for v2.3.
+///
+/// * `reader` must be positioned at the start of the tag body (just after the
+///   10-byte ID3 tag header); it is restored to that position on return.
+/// * `tag_size` is the tag body length (from [`ID3V2Header::decode_tag_size`]).
+/// * `flags` is the ID3 tag-header flags byte.
 fn validate_id3v2_3_frames<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     tag_size: u32,
+    flags: u8,
 ) -> Result<()> {
+    const UNSYNCHRONISATION: u8 = 0x80;
+    const EXTENDED_HEADER: u8 = 0x40;
+
     let tag_start = reader
         .stream_position()
         .map_err(|_| Error::InvalidAsset("could not read ID3 tag position".to_string()))?;
@@ -144,6 +186,73 @@ fn validate_id3v2_3_frames<R: std::io::Read + std::io::Seek>(
         .checked_add(tag_size as u64)
         .ok_or_else(|| Error::InvalidAsset("ID3 tag size overflow".to_string()))?;
 
+    // Skip the extended header exactly as the id3 crate does before parsing
+    // frames: 6 fixed bytes whose leading synchsafe u32 gives the total size.
+    let mut frames_start = tag_start;
+    if (flags & EXTENDED_HEADER) != 0 {
+        let mut ext_hdr = [0u8; 6];
+        if reader.read_exact(&mut ext_hdr).is_err() {
+            let _ = reader.seek(SeekFrom::Start(tag_start));
+            return Ok(()); // malformed; the id3 crate rejects it, no underflow
+        }
+        let ext_size = ID3V2Header::decode_tag_size(u32::from_be_bytes([
+            ext_hdr[0], ext_hdr[1], ext_hdr[2], ext_hdr[3],
+        ]));
+        // The crate requires ext_size >= 6 and errors otherwise (no crash).
+        frames_start = match tag_start.checked_add(ext_size as u64) {
+            Some(start) if ext_size >= 6 && start <= tag_end => start,
+            _ => {
+                let _ = reader.seek(SeekFrom::Start(tag_start));
+                return Ok(()); // no valid frame region; not the underflow path
+            }
+        };
+    }
+
+    if (flags & UNSYNCHRONISATION) != 0 {
+        // Unsynchronised: raw byte offsets no longer match decoded frame sizes,
+        // so buffer the frame region, reverse unsynchronisation, and walk the
+        // decoded bytes in memory. The region is bounded by the tag size and the
+        // real stream length, so this cannot over-allocate.
+        reader
+            .seek(SeekFrom::Start(frames_start))
+            .map_err(|_| Error::InvalidAsset("could not seek to ID3 frames".to_string()))?;
+        let region_len = tag_end - frames_start;
+        let mut raw = Vec::new();
+        reader
+            .by_ref()
+            .take(region_len)
+            .read_to_end(&mut raw)
+            .map_err(|_| Error::InvalidAsset("could not read ID3 frame region".to_string()))?;
+        reader
+            .seek(SeekFrom::Start(tag_start))
+            .map_err(|_| Error::InvalidAsset("could not rewind ID3 tag body".to_string()))?;
+
+        let body = decode_unsynch(&raw);
+        let mut offset = 0usize;
+        while offset + 10 <= body.len() {
+            if body[offset] == 0 {
+                break; // padding
+            }
+            let mut frame_hdr = [0u8; 10];
+            frame_hdr.copy_from_slice(&body[offset..offset + 10]);
+            if id3v2_3_frame_underflows(&frame_hdr) {
+                return Err(Error::InvalidAsset(
+                    "ID3v2.3 compressed frame body is shorter than 4 bytes".to_string(),
+                ));
+            }
+            let content_size =
+                u32::from_be_bytes([frame_hdr[4], frame_hdr[5], frame_hdr[6], frame_hdr[7]])
+                    as usize;
+            offset = offset.saturating_add(10).saturating_add(content_size);
+        }
+        return Ok(());
+    }
+
+    // Common path (no unsynchronisation): stream the frame headers and seek past
+    // bodies so a large embedded manifest is never buffered.
+    reader
+        .seek(SeekFrom::Start(frames_start))
+        .map_err(|_| Error::InvalidAsset("could not seek to ID3 frames".to_string()))?;
     loop {
         let pos = reader
             .stream_position()
@@ -163,16 +272,7 @@ fn validate_id3v2_3_frames<R: std::io::Read + std::io::Seek>(
             break;
         }
 
-        // ID3v2.3 uses raw big-endian u32 for the frame size.
-        let content_size =
-            u32::from_be_bytes([frame_hdr[4], frame_hdr[5], frame_hdr[6], frame_hdr[7]]);
-
-        // Format flags live in the second flags byte. Per ID3v2.3 §3.3.1
-        // the COMPRESSION bit is 0x80. A compressed frame body must hold at
-        // minimum the 4-byte decompressed-size prefix that the id3 crate
-        // consumes at v3.rs:50 before the underflowing subtraction.
-        let format_flags = frame_hdr[9];
-        if (format_flags & 0x80) != 0 && content_size < 4 {
+        if id3v2_3_frame_underflows(&frame_hdr) {
             return Err(Error::InvalidAsset(
                 "ID3v2.3 compressed frame body is shorter than 4 bytes".to_string(),
             ));
@@ -180,6 +280,8 @@ fn validate_id3v2_3_frames<R: std::io::Read + std::io::Seek>(
 
         // Seek past the frame body. content_size is a u32; the cast to i64
         // is always non-negative and cannot wrap.
+        let content_size =
+            u32::from_be_bytes([frame_hdr[4], frame_hdr[5], frame_hdr[6], frame_hdr[7]]);
         if reader.seek(SeekFrom::Current(content_size as i64)).is_err() {
             break;
         }
@@ -232,7 +334,7 @@ pub(crate) fn read_tag_safely(input_stream: &mut dyn CAIRead) -> Option<Tag> {
         let mut probe = CAIReadWrapper {
             reader: input_stream,
         };
-        if validate_id3v2_3_frames(&mut probe, header.tag_size).is_err() {
+        if validate_id3v2_3_frames(&mut probe, header.tag_size, header._flags).is_err() {
             let _ = input_stream.rewind();
             return None;
         }
@@ -839,8 +941,26 @@ mod tests {
 
     use std::io::Cursor;
 
-    use super::{read_tag_safely, test_helpers::id3_header, validate_id3v2_3_frames};
+    use super::{
+        decode_unsynch, read_tag_safely, test_helpers::id3_header, validate_id3v2_3_frames,
+    };
     use crate::error::Error;
+
+    /// Synchsafe-encodes a 28-bit integer (inverse of
+    /// [`super::ID3V2Header::decode_tag_size`]), for building tag/extended-header
+    /// size fields in tests.
+    fn synchsafe(n: u32) -> u32 {
+        (n & 0x7f) | ((n & 0x3f80) << 1) | ((n & 0x1f_c000) << 2) | ((n & 0xfe0_0000) << 3)
+    }
+
+    /// Builds a minimal 6-byte ID3v2.3 extended header whose synchsafe size
+    /// field equals `ext_size` (the total extended-header length).
+    fn v23_extended_header(ext_size: u32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&synchsafe(ext_size).to_be_bytes());
+        h.extend_from_slice(&[0x00, 0x00]); // extended flags + padding-size byte(s)
+        h
+    }
 
     /// Build a single ID3v2.3 frame header (10 bytes) with the given frame
     /// ID, body size, and format-flags byte.
@@ -870,7 +990,7 @@ mod tests {
         // Position the reader at the start of the tag body (id3_header is 10
         // bytes; we do not include it because validator wants only the body).
         let mut cursor = Cursor::new(frame.to_vec());
-        let result = validate_id3v2_3_frames(&mut cursor, tag_body_size);
+        let result = validate_id3v2_3_frames(&mut cursor, tag_body_size, 0);
 
         assert!(
             matches!(&result, Err(Error::InvalidAsset(msg)) if msg.contains("compressed frame body")),
@@ -889,7 +1009,7 @@ mod tests {
         body.extend_from_slice(&[0u8; 3]);
 
         let mut cursor = Cursor::new(body);
-        let result = validate_id3v2_3_frames(&mut cursor, tag_body_size);
+        let result = validate_id3v2_3_frames(&mut cursor, tag_body_size, 0);
 
         assert!(matches!(result, Err(Error::InvalidAsset(_))));
     }
@@ -906,7 +1026,7 @@ mod tests {
         body.extend_from_slice(&[0u8; 5]);
 
         let mut cursor = Cursor::new(body);
-        validate_id3v2_3_frames(&mut cursor, tag_body_size)
+        validate_id3v2_3_frames(&mut cursor, tag_body_size, 0)
             .expect("legitimate v2.3 frame must not be rejected");
     }
 
@@ -920,7 +1040,7 @@ mod tests {
         body.extend_from_slice(&[0u8; 4]);
 
         let mut cursor = Cursor::new(body);
-        validate_id3v2_3_frames(&mut cursor, tag_body_size)
+        validate_id3v2_3_frames(&mut cursor, tag_body_size, 0)
             .expect("compressed frame with body == 4 must be accepted");
     }
 
@@ -943,6 +1063,92 @@ mod tests {
         assert!(
             read_tag_safely(&mut cursor).is_none(),
             "malicious v2.3 tag must not produce a Tag",
+        );
+    }
+
+    // Unit test for the unsynchronisation reversal: a 0x00 immediately after a
+    // 0xFF is dropped; everything else is preserved.
+    #[test]
+    fn decode_unsynch_drops_null_after_ff() {
+        assert_eq!(decode_unsynch(&[0xff, 0x00, 0x11]), vec![0xff, 0x11]);
+        assert_eq!(decode_unsynch(&[0xff, 0x00, 0x00]), vec![0xff, 0x00]);
+        assert_eq!(decode_unsynch(&[0xff, 0xff, 0x00]), vec![0xff, 0xff]);
+        assert_eq!(decode_unsynch(&[0x01, 0x02, 0x03]), vec![0x01, 0x02, 0x03]);
+    }
+
+    // Flag-handling regression: a v2.3 tag with the UNSYNCHRONISATION flag set.
+    // Frame A's raw content carries a `0xFF 0x00` pair, so its declared size (2,
+    // the de-unsynchronised length) does not match its raw byte count (3). A
+    // naive raw walk would seek by 2, land mid-content, and misread the next
+    // header — missing the malicious frame B. Only after reversing
+    // unsynchronisation do frame boundaries line up and expose the underflow.
+    #[test]
+    fn validator_rejects_v23_underflow_with_unsync_flag() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&v23_frame_header(b"TXXX", 2, 0x00)); // benign, size 2
+        raw.extend_from_slice(&[0xff, 0x00, 0x11]); // de-syncs to [0xff, 0x11]
+        raw.extend_from_slice(&v23_frame_header(b"TIT2", 0, 0x80)); // malicious
+
+        let tag_size = raw.len() as u32; // raw (unsynchronised) length
+        let mut cursor = Cursor::new(raw);
+        let result = validate_id3v2_3_frames(&mut cursor, tag_size, 0x80);
+        assert!(
+            matches!(&result, Err(Error::InvalidAsset(msg)) if msg.contains("compressed frame body")),
+            "unsync path must catch the underflow frame, got {result:?}",
+        );
+    }
+
+    // Flag-handling regression: a v2.3 tag with the EXTENDED_HEADER flag set.
+    // Frames begin after the extended header, which the validator must skip (as
+    // the id3 crate does) before it can see — and reject — the malicious frame.
+    #[test]
+    fn validator_rejects_v23_underflow_behind_extended_header() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&v23_extended_header(6)); // 6-byte extended header
+        body.extend_from_slice(&v23_frame_header(b"TIT2", 0, 0x80)); // malicious
+
+        let tag_size = body.len() as u32;
+        let mut cursor = Cursor::new(body);
+        let result = validate_id3v2_3_frames(&mut cursor, tag_size, 0x40);
+        assert!(
+            matches!(&result, Err(Error::InvalidAsset(msg)) if msg.contains("compressed frame body")),
+            "extended-header path must catch the underflow frame, got {result:?}",
+        );
+    }
+
+    // Happy path: a valid compressed frame (body >= 4) behind an extended header
+    // must still be accepted — the flag handling must not over-reject.
+    #[test]
+    fn validator_accepts_valid_v23_tag_with_extended_header() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&v23_extended_header(6));
+        body.extend_from_slice(&v23_frame_header(b"TIT2", 4, 0x80)); // compressed, size 4
+        body.extend_from_slice(&[0u8; 4]);
+
+        let tag_size = body.len() as u32;
+        let mut cursor = Cursor::new(body);
+        validate_id3v2_3_frames(&mut cursor, tag_size, 0x40)
+            .expect("valid compressed frame behind an extended header must be accepted");
+    }
+
+    // End-to-end: `read_tag_safely` on a full unsynchronised v2.3 tag carrying
+    // the malicious compressed frame must return None (no process abort).
+    #[test]
+    fn read_tag_safely_returns_none_on_unsync_v23_compression() {
+        let frame = v23_frame_header(b"TIT2", 0, 0x80);
+        let tag_size = frame.len() as u32;
+
+        let mut header = id3_header(3, tag_size);
+        header[5] = 0x80; // set the unsynchronisation flag
+
+        let mut full = Vec::new();
+        full.extend_from_slice(&header);
+        full.extend_from_slice(&frame);
+
+        let mut cursor = Cursor::new(full);
+        assert!(
+            read_tag_safely(&mut cursor).is_none(),
+            "malicious unsynchronised v2.3 tag must not produce a Tag",
         );
     }
 }
