@@ -579,16 +579,27 @@ pub fn verify_time_stamp(
                 last_err = TimeStampError::Untrusted;
                 continue;
             }
+
+            // Only reachable once `check_end_entity_certificate_profile` and
+            // `check_certificate_trust` have both succeeded, so the code now
+            // reports a decision that was actually made. When `verify_trust` is
+            // false nothing is logged for trust at all: `TIMESTAMP_VALIDATED`
+            // above already reports what was established (the token's signature
+            // and message imprint), and claiming more than that is the bug.
+            log_item!(
+                "",
+                format!("timestamp cert trusted: {}", &common_name),
+                "verify_time_stamp"
+            )
+            .validation_status(TIMESTAMP_TRUSTED)
+            .success(&mut current_validation_log);
         }
 
-        log_item!(
-            "",
-            format!("timestamp cert trusted: {}", &common_name),
-            "verify_time_stamp"
-        )
-        .validation_status(TIMESTAMP_TRUSTED)
-        .success(&mut current_validation_log);
-
+        // Outside the `verify_trust` block on purpose. `verify_time_stamp` is
+        // called with `verify_trust = false` on the *outgoing* path
+        // (`time_stamp/http_request.rs`, `assertions/timestamp.rs`), where the
+        // `Result` is `?`-propagated -- moving the return inside would turn
+        // every freshly obtained timestamp into `Err(last_err)`.
         // If we find a valid value, we're done.
         validation_log.append(&current_validation_log);
         return Ok(tst);
@@ -893,5 +904,121 @@ async fn validate_timestamp_sig_async(
             .map_err(|_| TimeStampError::InvalidData)
     } else {
         Err(TimeStampError::UnsupportedAlgorithm)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::{
+        crypto::{
+            base64,
+            cose::{parse_cose_sign1, validate_cose_tst_info, CertificateTrustPolicy},
+            hash::sha256,
+        },
+        status_tracker::StatusTracker,
+        store::Store,
+    };
+
+    /// Carries a `sigTst` header, so it exercises the real timestamp path
+    /// rather than a synthesised token. Any fixture in the list produced by
+    /// `grep -rla sigTst sdk/tests/fixtures` would do.
+    const CA_JPG: &[u8] = include_bytes!("../../../tests/fixtures/CA.jpg");
+
+    /// The parsed `COSE_Sign1` of `CA.jpg`'s active claim, and the claim bytes
+    /// it was computed over — the two inputs `validate_cose_tst_info` needs.
+    fn ca_jpg_sign1() -> (coset::CoseSign1, Vec<u8>) {
+        let mut stream = std::io::Cursor::new(CA_JPG);
+        let jumbf = crate::jumbf_io::load_jumbf_from_stream("image/jpeg", &mut stream).unwrap();
+
+        let mut log = StatusTracker::default();
+        let store = Store::from_jumbf(&jumbf, &mut log).unwrap();
+        let claim = store.provenance_claim().unwrap();
+
+        let data = claim.data().unwrap();
+        let sign1 = parse_cose_sign1(claim.signature_val(), &data, &mut log).unwrap();
+        (sign1, data)
+    }
+
+    /// `check_certificate_trust` accepts an end-entity certificate listed by
+    /// the base64 SHA-256 of its DER (§14.4.3), which is the cheapest way to
+    /// give the test an anchor that genuinely matches this token's signer
+    /// without shipping a PEM bundle alongside the fixture.
+    fn end_entity_credential_line(cert_der: &[u8]) -> String {
+        base64::encode(&sha256(cert_der))
+    }
+
+    fn tsa_signer_cert(sign1: &coset::CoseSign1, data: &[u8]) -> Vec<u8> {
+        let token = crate::crypto::cose::timestamp_token_bytes_from_sign1(sign1)
+            .expect("fixture carries a sigTst token");
+        let _ = data;
+        tsa_signer_cert_der_from_token(&token)
+            .unwrap()
+            .expect("token names a signer certificate")
+    }
+
+    /// Upstream #2317: `TIMESTAMP_TRUSTED` used to be logged after the
+    /// `if verify_trust` block, so it was emitted even when no trust check ran.
+    /// `claim.rs` sets `verify_timestamp_trust = false` for every claim v1, so
+    /// that path produced a `timeStamp.trusted` backed by nothing.
+    ///
+    /// Reverting the patch (moving the `log_item!` back below the block) makes
+    /// this assertion fail; `TIMESTAMP_VALIDATED` is asserted alongside it so
+    /// the test cannot pass by never reaching the code at all.
+    #[test]
+    fn no_trusted_code_when_trust_checking_is_off() {
+        let (sign1, data) = ca_jpg_sign1();
+        let ctp = CertificateTrustPolicy::new();
+        let mut log = StatusTracker::default();
+
+        validate_cose_tst_info(&sign1, &data, &ctp, &mut log, false)
+            .expect("the fixture's timestamp token verifies");
+
+        assert!(
+            log.has_status(TIMESTAMP_VALIDATED),
+            "the token's signature and message imprint were checked, so this must be logged"
+        );
+        assert!(
+            !log.has_status(TIMESTAMP_TRUSTED),
+            "no trust check ran, so nothing may claim the TSA is trusted"
+        );
+    }
+
+    /// The other half: with `verify_trust` on and an anchor that does match,
+    /// the code is still emitted. Without this, the patch could be "fixed" by
+    /// deleting the code outright and the suite would stay green.
+    #[test]
+    fn trusted_code_when_trust_checking_is_on_and_the_anchor_matches() {
+        let (sign1, data) = ca_jpg_sign1();
+
+        let mut ctp = CertificateTrustPolicy::new();
+        let leaf = tsa_signer_cert(&sign1, &data);
+        ctp.add_end_entity_credentials(end_entity_credential_line(&leaf).as_bytes())
+            .unwrap();
+
+        let mut log = StatusTracker::default();
+        validate_cose_tst_info(&sign1, &data, &ctp, &mut log, true)
+            .expect("the fixture's timestamp token verifies");
+
+        assert!(log.has_status(TIMESTAMP_VALIDATED));
+        assert!(
+            log.has_status(TIMESTAMP_TRUSTED),
+            "the trust check succeeded, so the code must still be emitted"
+        );
+    }
+
+    /// And with trust checking on against a store the token cannot reach, the
+    /// outcome is `untrusted`, never `trusted`.
+    #[test]
+    fn untrusted_code_when_trust_checking_is_on_and_nothing_matches() {
+        let (sign1, data) = ca_jpg_sign1();
+        let ctp = CertificateTrustPolicy::new();
+        let mut log = StatusTracker::default();
+
+        let _ = validate_cose_tst_info(&sign1, &data, &ctp, &mut log, true);
+
+        assert!(!log.has_status(TIMESTAMP_TRUSTED));
+        assert!(log.has_status(TIMESTAMP_UNTRUSTED));
     }
 }
