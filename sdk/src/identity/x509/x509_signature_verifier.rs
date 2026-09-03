@@ -168,12 +168,30 @@ impl ToCredentialSummary for X509SignatureInfo {
 pub struct X509SignatureReport {
     pub signer_payload: SignerPayload,
     pub signature_info: crate::SignatureInfo,
+
+    /// The identity signer's certificate chain, leaf first, PEM.
+    ///
+    /// The same bytes as `signature_info.cert_chain`, which is `#[serde(skip)]`
+    /// and therefore unreachable: this report *is* the value the SDK substitutes
+    /// for the assertion, so a caller reading a validated `cawg.identity`
+    /// assertion has no other route to the chain. `CertificateInfo::cert_chain`
+    /// is public, but the `X509SignatureInfo` holding it is consumed here and
+    /// never handed back.
+    ///
+    /// Evidence, not a conclusion. CAWG Identity 1.3 §8.2.2.1 keys trust anchors
+    /// and certificate-policy OIDs to the certificate's Extended Key Usage and
+    /// §8.2.4.1 adds a date window; a consumer cannot evaluate any of that
+    /// without the certificates. Nothing about validation changes.
+    pub cert_chain_pem: String,
 }
 
 impl X509SignatureReport {
     fn from_x509_signature_info(info: &X509SignatureInfo) -> Self {
+        let cert_chain_pem =
+            String::from_utf8(info.cert_info.cert_chain.to_vec()).unwrap_or_default();
         X509SignatureReport {
             signer_payload: info.signer_payload.clone(),
+            cert_chain_pem: cert_chain_pem.clone(),
             signature_info: crate::SignatureInfo {
                 alg: info.cert_info.alg,
                 issuer: info.cert_info.issuer_org.clone(),
@@ -184,8 +202,7 @@ impl X509SignatureReport {
                     .cert_serial_number
                     .as_ref()
                     .map(|s| s.to_string()),
-                cert_chain: String::from_utf8(info.cert_info.cert_chain.to_vec())
-                    .unwrap_or_default(),
+                cert_chain: cert_chain_pem,
                 // A CAWG identity signature is not time-stamped through `sigTst`
                 // -- the identity assertion's own time comes from the claim
                 // signature it is bound to -- so this is always empty here.
@@ -217,6 +234,7 @@ mod tests {
         },
         identity::{
             builder::{IdentityAssertionBuilder, IdentityAssertionSigner},
+            identity_assertion::signature_verifier::ToCredentialSummary,
             tests::{
                 fixtures::{cert_chain_and_private_key_for_alg, manifest_json, parent_json},
                 read_manifest,
@@ -312,6 +330,105 @@ mod tests {
         assert_eq!(
             log.validation_status.as_ref().unwrap().as_ref() as &str,
             "signingCredential.untrusted"
+        );
+    }
+
+    /// The identity signer's certificate chain survives into the serialized
+    /// report.
+    ///
+    /// `SignatureInfo::cert_chain` is `#[serde(skip)]`, and the report is what
+    /// the SDK substitutes for the assertion value, so before `cert_chain_pem`
+    /// existed a consumer reading a validated `cawg.identity` assertion could
+    /// not reach the certificates at all. Asserted through `serde_json`
+    /// specifically, because that is the only surface a consumer sees; a field
+    /// that exists on the struct but is skipped is no better than absent.
+    #[c2pa_test_async]
+    async fn cert_chain_pem_round_trips_through_serde_json() {
+        let format = "image/jpeg";
+        let mut source = Cursor::new(TEST_IMAGE);
+        let mut dest = Cursor::new(Vec::new());
+
+        let mut builder = Builder::default().with_definition(manifest_json()).unwrap();
+        builder
+            .add_ingredient_from_stream(parent_json(), format, &mut source)
+            .unwrap();
+        builder
+            .add_resource("thumbnail.jpg", Cursor::new(TEST_THUMBNAIL))
+            .unwrap();
+
+        let mut c2pa_signer = IdentityAssertionSigner::from_test_credentials(SigningAlg::Ps256);
+
+        let (cawg_cert_chain, cawg_private_key) =
+            cert_chain_and_private_key_for_alg(SigningAlg::Ed25519);
+
+        let cawg_raw_signer = raw_signature::signer_from_cert_chain_and_private_key(
+            &cawg_cert_chain,
+            &cawg_private_key,
+            SigningAlg::Ed25519,
+            None,
+        )
+        .unwrap();
+
+        let x509_holder = X509CredentialHolder::from_raw_signer(cawg_raw_signer);
+        c2pa_signer
+            .add_identity_assertion(IdentityAssertionBuilder::for_credential_holder(x509_holder));
+
+        builder
+            .sign(&c2pa_signer, format, &mut source, &mut dest)
+            .unwrap();
+        dest.rewind().unwrap();
+
+        let manifest_store = read_manifest(format, &mut dest).await;
+        let manifest = manifest_store.active_manifest().unwrap();
+        let mut st = StatusTracker::default();
+        let ia = IdentityAssertion::from_manifest(manifest, &mut st)
+            .next()
+            .unwrap()
+            .unwrap();
+
+        // Trust is beside the point here; the chain is reported either way.
+        let x509_verifier = X509SignatureVerifier {
+            cose_verifier: Verifier::IgnoreProfileAndTrustPolicy,
+        };
+        let info = ia
+            .validate(manifest, &mut st, &x509_verifier)
+            .await
+            .unwrap();
+
+        let json = serde_json::to_value(info.to_summary()).unwrap();
+        let pem = json
+            .get("cert_chain_pem")
+            .and_then(|v| v.as_str())
+            .expect("cert_chain_pem is serialized");
+
+        assert!(
+            pem.starts_with("-----BEGIN CERTIFICATE-----"),
+            "expected a PEM chain, got {:?}",
+            &pem[..pem.len().min(64)]
+        );
+        // The bytes we signed with, not merely *some* PEM: the whole point is
+        // that a consumer can evaluate this specific signer's chain. Compared
+        // after trimming, because the chain makes a round trip through DER and
+        // back and comes out one trailing newline shorter.
+        assert_eq!(
+            pem.trim_end(),
+            String::from_utf8(cawg_cert_chain.clone())
+                .unwrap()
+                .trim_end(),
+            "the reported chain is not the one the identity was signed with"
+        );
+        assert_eq!(
+            pem.matches("-----BEGIN CERTIFICATE-----").count(),
+            2,
+            "leaf and issuer, in that order"
+        );
+
+        // And the neighbouring field is still skipped, so this is additive.
+        assert!(
+            json.get("signature_info")
+                .and_then(|v| v.get("cert_chain"))
+                .is_none(),
+            "SignatureInfo::cert_chain must stay unserialized"
         );
     }
 }
