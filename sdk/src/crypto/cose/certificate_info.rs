@@ -45,6 +45,17 @@ pub struct CertificateInfo {
     /// Certificate chain used to validate the signature
     pub cert_chain: Vec<u8>,
 
+    /// Certificate chain of the RFC 3161 time-stamp authority, leaf first, in
+    /// the same PEM encoding as `cert_chain`. Empty when the signature carries
+    /// no time-stamp, or when the token's certificate set could not be parsed.
+    ///
+    /// Extracted from the token, not a by-product of verifying it: C2PA 2.4
+    /// §14.4.2 requires TSA trust anchors to be held separately from claim-signer
+    /// anchors, and `Settings::Trust` has a single anchor slot, so a caller that
+    /// maintains its own TSA list needs the chain in order to evaluate it. See
+    /// `crypto::time_stamp::tsa_cert_chain_der_from_token`.
+    pub tsa_cert_chain: Vec<u8>,
+
     /// Signature revocation status
     ///
     /// TO REVIEW: What does this `bool` mean?

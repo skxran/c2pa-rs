@@ -23,10 +23,12 @@ use crate::{
         base64,
         cose::{
             cert_chain_from_sign1, parse_cose_sign1, signing_alg_from_sign1,
-            signing_time_from_sign1, signing_time_from_sign1_async, validate_cose_tst_info,
-            validate_cose_tst_info_async, CertificateInfo, CertificateTrustPolicy, Verifier,
+            signing_time_from_sign1, signing_time_from_sign1_async,
+            timestamp_token_bytes_from_sign1, validate_cose_tst_info, validate_cose_tst_info_async,
+            CertificateInfo, CertificateTrustPolicy, Verifier,
         },
         raw_signature::SigningAlg,
+        time_stamp::tsa_cert_chain_der_from_token,
     },
     error::{Error, Result},
     settings::Settings,
@@ -231,12 +233,26 @@ pub(crate) fn get_signing_info(
         Err(e) => Err(e.into()),
     };
 
-    let certs = match sign1 {
-        Ok(s) => match cert_chain_from_sign1(&s) {
-            Ok(c) => dump_cert_chain(&c).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
-        Err(_e) => Vec::new(),
+    // The TSA's own chain, alongside the signer's. Parsed out of the `sigTst`
+    // token rather than recovered from `verify_time_stamp`, which discards it:
+    // C2PA 2.4 14.4.2 wants TSA anchors held apart from signer anchors, and
+    // `Settings::Trust` has one slot, so a caller with its own TSA list has no
+    // other way to reach the chain. Empty when there is no time-stamp. This is
+    // extraction, not verification -- see `tsa_cert_chain_der_from_token`.
+    let (certs, tsa_certs) = match sign1 {
+        Ok(s) => {
+            let signer = match cert_chain_from_sign1(&s) {
+                Ok(c) => dump_cert_chain(&c).unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            let tsa = timestamp_token_bytes_from_sign1(&s)
+                .and_then(|token| tsa_cert_chain_der_from_token(&token).ok())
+                .filter(|chain| !chain.is_empty())
+                .and_then(|chain| dump_cert_chain(&chain).ok())
+                .unwrap_or_default();
+            (signer, tsa)
+        }
+        Err(_e) => (Vec::new(), Vec::new()),
     };
 
     CertificateInfo {
@@ -245,6 +261,7 @@ pub(crate) fn get_signing_info(
         alg,
         validated: false,
         cert_chain: certs,
+        tsa_cert_chain: tsa_certs,
         cert_serial_number,
         revocation_status: None,
         iat: None,

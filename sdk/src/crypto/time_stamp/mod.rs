@@ -28,4 +28,7 @@ mod response;
 pub(crate) use response::{ContentInfo, TimeStampResponse};
 
 mod verify;
-pub use verify::{tsa_signer_cert_der_from_token, verify_time_stamp, verify_time_stamp_async};
+pub use verify::{
+    tsa_cert_chain_der_from_token, tsa_signer_cert_der_from_token, verify_time_stamp,
+    verify_time_stamp_async,
+};

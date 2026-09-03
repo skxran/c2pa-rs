@@ -702,6 +702,11 @@ impl Manifest {
                 cert_serial_number: signature_info.cert_serial_number.map(|s| s.to_string()),
                 cert_chain: String::from_utf8(signature_info.cert_chain)
                     .map_err(|_e| Error::CoseInvalidCert)?,
+                // Lossy rather than fatal: a TSA chain that will not decode is
+                // missing evidence, not a reason to refuse the whole manifest,
+                // and `cert_chain` above is what the signer's identity rests on.
+                tsa_cert_chain: String::from_utf8(signature_info.tsa_cert_chain)
+                    .unwrap_or_default(),
                 revocation_status: signature_info.revocation_status,
             }),
             None => None,
@@ -747,12 +752,29 @@ pub struct SignatureInfo {
     /// The cert chain for this claim.
     #[serde(skip)] // don't serialize this, let someone ask for it
     pub cert_chain: String,
+
+    /// The RFC 3161 time-stamp authority's cert chain, leaf first, PEM, in the
+    /// same encoding as `cert_chain`. Empty when the signature has no
+    /// time-stamp.
+    ///
+    /// Extracted from the `sigTst` token, not a by-product of verifying it, so
+    /// it is evidence about *which* TSA signed rather than a statement that the
+    /// token is good -- read it together with the `timeStamp.*` status codes.
+    /// Present because C2PA 2.4 §14.4.2 requires TSA trust anchors to be held
+    /// separately from claim-signer anchors and `Settings::Trust` has one slot.
+    #[serde(skip)] // same as cert_chain: JSON output is unchanged
+    pub tsa_cert_chain: String,
 }
 
 impl SignatureInfo {
     // returns the cert chain for this signature
     pub fn cert_chain(&self) -> &str {
         &self.cert_chain
+    }
+
+    // returns the time-stamp authority's cert chain, or "" if there is none
+    pub fn tsa_cert_chain(&self) -> &str {
+        &self.tsa_cert_chain
     }
 }
 

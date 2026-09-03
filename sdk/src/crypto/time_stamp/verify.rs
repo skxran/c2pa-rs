@@ -609,9 +609,14 @@ pub fn verify_time_stamp(
     Err(last_err)
 }
 
-/// Extract the TSA signer certificate (DER) from an RFC 3161 timestamp token.
-/// Does not verify the token; only parses it and returns the first signer's certificate.
-pub fn tsa_signer_cert_der_from_token(ts: &[u8]) -> Result<Option<Vec<u8>>, TimeStampError> {
+/// The token's certificate set as DER, plus the index of the first signer's
+/// certificate within it. `None` when the token carries no certificates or no
+/// `SignerInfo` that any of them matches.
+///
+/// Shared by [`tsa_signer_cert_der_from_token`] and
+/// [`tsa_cert_chain_der_from_token`], which differ only in how much of the
+/// result they return. Neither verifies the token.
+fn signer_certs_from_token(ts: &[u8]) -> Result<Option<(Vec<Vec<u8>>, usize)>, TimeStampError> {
     let Some(sd) = signed_data_from_time_stamp_response(ts)? else {
         return Ok(None);
     };
@@ -634,6 +639,8 @@ pub fn tsa_signer_cert_der_from_token(ts: &[u8]) -> Result<Option<Vec<u8>>, Time
             "time stamp certificate could not be processed".to_string(),
         ));
     }
+    // RFC 3161 tokens carry exactly one `SignerInfo`; `verify_time_stamp` loops
+    // over them only because CMS permits more.
     let Some(signer_info) = sd.signer_infos.to_vec().into_iter().next() else {
         return Ok(None);
     };
@@ -665,7 +672,37 @@ pub fn tsa_signer_cert_der_from_token(ts: &[u8]) -> Result<Option<Vec<u8>>, Time
     }) else {
         return Ok(None);
     };
+    Ok(Some((cert_ders, cert_pos)))
+}
+
+/// Extract the TSA signer certificate (DER) from an RFC 3161 timestamp token.
+/// Does not verify the token; only parses it and returns the first signer's certificate.
+pub fn tsa_signer_cert_der_from_token(ts: &[u8]) -> Result<Option<Vec<u8>>, TimeStampError> {
+    let Some((cert_ders, cert_pos)) = signer_certs_from_token(ts)? else {
+        return Ok(None);
+    };
     Ok(Some(cert_ders[cert_pos].clone()))
+}
+
+/// Extract the TSA's certificate chain (DER, leaf first) from an RFC 3161
+/// timestamp token, ordered by [`order_certificates_leaf_to_root`] -- the same
+/// ordering [`verify_time_stamp`] applies before its own trust check.
+///
+/// Does not verify the token, and says nothing about whether it verifies: a
+/// caller that acts on the chain must first establish that the token itself is
+/// usable (`timeStamp.validated`, and no `timeStamp.mismatch` /
+/// `.malformed` / `.outsideValidity`).
+///
+/// Exists because C2PA 2.4 §14.4.2 requires TSA trust anchors to be maintained
+/// separately from claim-signer anchors, while `Settings::Trust` has a single
+/// anchor slot and `verify_time_stamp` narrows only the EKU. Without the chain,
+/// the only way to ask "does this TSA chain to *my* TSA list" is to re-verify
+/// the whole asset under a different `trust_anchors`.
+pub fn tsa_cert_chain_der_from_token(ts: &[u8]) -> Result<Vec<Vec<u8>>, TimeStampError> {
+    let Some((cert_ders, cert_pos)) = signer_certs_from_token(ts)? else {
+        return Ok(Vec::new());
+    };
+    order_certificates_leaf_to_root(&cert_ders, cert_pos)
 }
 
 fn generalized_time_to_datetime<T: Into<DateTime<Utc>>>(gt: T) -> DateTime<Utc> {
@@ -956,6 +993,47 @@ mod tests {
         tsa_signer_cert_der_from_token(&token)
             .unwrap()
             .expect("token names a signer certificate")
+    }
+
+    /// The chain the fork exposes must be the *same* certificates
+    /// `verify_time_stamp` builds for its own trust check, in the same order --
+    /// otherwise a caller evaluating it against a TSA list is answering a
+    /// different question from the one the status codes report.
+    #[test]
+    fn the_exposed_tsa_chain_is_leaf_first_and_starts_at_the_signer() {
+        let (sign1, data) = ca_jpg_sign1();
+        let token = crate::crypto::cose::timestamp_token_bytes_from_sign1(&sign1)
+            .expect("fixture carries a sigTst token");
+
+        let chain = tsa_cert_chain_der_from_token(&token).unwrap();
+        assert!(!chain.is_empty(), "the token carries certificates");
+        assert_eq!(
+            chain[0],
+            tsa_signer_cert(&sign1, &data),
+            "element 0 must be the signer's own certificate, not an issuer"
+        );
+
+        // Leaf first means each element is issued by the next one.
+        for pair in chain.windows(2) {
+            let (_, child) = x509_parser::certificate::X509Certificate::from_der(&pair[0]).unwrap();
+            let (_, parent) =
+                x509_parser::certificate::X509Certificate::from_der(&pair[1]).unwrap();
+            assert_eq!(
+                child.issuer(),
+                parent.subject(),
+                "chain is not ordered leaf to root"
+            );
+        }
+    }
+
+    /// A signature with no `sigTst` must yield an empty chain rather than an
+    /// error or a borrowed signer chain. `SignatureInfo::tsa_cert_chain` is
+    /// `""` in that case, and a caller keys "no time-stamp" off exactly that.
+    #[test]
+    fn a_token_that_is_not_a_token_yields_an_empty_chain() {
+        assert!(tsa_cert_chain_der_from_token(b"not a timestamp token")
+            .unwrap_or_default()
+            .is_empty());
     }
 
     /// Upstream #2317: `TIMESTAMP_TRUSTED` used to be logged after the

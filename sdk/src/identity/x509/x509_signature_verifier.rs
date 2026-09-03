@@ -186,6 +186,10 @@ impl X509SignatureReport {
                     .map(|s| s.to_string()),
                 cert_chain: String::from_utf8(info.cert_info.cert_chain.to_vec())
                     .unwrap_or_default(),
+                // A CAWG identity signature is not time-stamped through `sigTst`
+                // -- the identity assertion's own time comes from the claim
+                // signature it is bound to -- so this is always empty here.
+                tsa_cert_chain: String::new(),
                 revocation_status: info.cert_info.revocation_status,
             },
         }
