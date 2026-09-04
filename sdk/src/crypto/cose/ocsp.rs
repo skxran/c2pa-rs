@@ -124,6 +124,11 @@ pub fn check_ocsp_status(
             // we only care about OCSP value log info if the result is OK
             if let Ok(ocsp_response) = result {
                 if ocsp_log.has_status(validation_status::SIGNING_CREDENTIAL_REVOKED) {
+                    // A failure status, not an error: [§15.9.1] rejects the
+                    // *claim* with `signingCredential.ocsp.revoked`, and the
+                    // rest of validation continues so the verdict can say so.
+                    // Returning `Err` here aborted the whole read, and the
+                    // asset came back as unreadable rather than as revoked.
                     log_item!(
                         "",
                         format!(
@@ -133,11 +138,14 @@ pub fn check_ocsp_status(
                         "check_ocsp_status"
                     )
                     .validation_status(SIGNING_CREDENTIAL_REVOKED)
-                    .informational(validation_log);
+                    .failure_no_throw(
+                        validation_log,
+                        CoseError::CertificateTrustError(
+                            CertificateTrustError::CertificateNotTrusted,
+                        ),
+                    );
 
-                    return Err(CoseError::CertificateTrustError(
-                        CertificateTrustError::CertificateNotTrusted,
-                    ));
+                    return Ok(ocsp_response);
                 }
 
                 // If certificate is confirmed not revoked, return success
@@ -255,7 +263,8 @@ fn process_ocsp_responses(
             )
             .await
         } {
-            // If certificate is revoked, return error immediately
+            // If the certificate is revoked, that is the answer: a failure
+            // status on the claim (see the stapled arm above), not an error.
             if current_validation_log.has_status(validation_status::SIGNING_CREDENTIAL_REVOKED) {
                 log_item!(
                     "",
@@ -266,11 +275,12 @@ fn process_ocsp_responses(
                     "check_ocsp_status"
                 )
                 .validation_status(SIGNING_CREDENTIAL_REVOKED)
-                .informational(validation_log);
+                .failure_no_throw(
+                    validation_log,
+                    CoseError::CertificateTrustError(CertificateTrustError::CertificateNotTrusted),
+                );
 
-                return Err(CoseError::CertificateTrustError(
-                    CertificateTrustError::CertificateNotTrusted,
-                ));
+                return Ok(ocsp_response);
             }
             // If certificate is confirmed not revoked, return success
             if current_validation_log.has_status(validation_status::SIGNING_CREDENTIAL_NOT_REVOKED)
@@ -387,17 +397,17 @@ fn check_stapled_ocsp_response(
             return Ok(OcspResponse::default());
         }
 
-        // validate the trust; complete the responder's path from the signer's
-        // x5chain if the response does not embed the responder's issuing CA
+        // authorize the responder; complete the responder's path from the
+        // signer's x5chain if the response does not embed the responder's
+        // issuing CA
         let ocsp_cert_chain = extend_ocsp_cert_chain(ocsp_certs, &signing_cert_chain);
-        if new_ctp
-            .check_certificate_trust(
-                &ocsp_cert_chain,
-                first_cert,
-                signing_time.map(|t| t.timestamp()),
-            )
-            .is_err()
-        {
+        if !responder_is_authorized(
+            &ocsp_cert_chain,
+            first_cert,
+            &signing_cert_chain,
+            &new_ctp,
+            signing_time.map(|t| t.timestamp()),
+        ) {
             return Ok(OcspResponse::default());
         }
     } else {
@@ -407,6 +417,63 @@ fn check_stapled_ocsp_response(
     // only append usable OCSP responses to validation_log
     validation_log.append(&current_validation_log);
     Ok(ocsp_data)
+}
+
+/// Is the OCSP signer an "authorized responder" for the certificate in question?
+///
+/// RFC 6960 §4.2.2.2, which [§15.9.1, Determining revocation through OCSP
+/// responses in the C2PA Manifest Store] names as the test for accepting a
+/// response: the responder is the CA that issued the certificate, a responder
+/// that CA designated (a certificate issued directly by it carrying the OCSP
+/// signing EKU, which `check_end_entity_certificate_profile` has already
+/// required of `responder_der`), or a locally trusted responder (`ctp`).
+///
+/// This replaced a check that anchored the responder to the *C2PA trust list*.
+/// That test is the one for claim signers, not responders: under it the
+/// revocation status of a certificate whose CA is not on the list could never
+/// be learned, so a revoked signer under an unlisted CA read as merely
+/// "untrusted" and its stored OCSP response was silently discarded.
+///
+/// [§15.9.1, Determining revocation through OCSP responses in the C2PA Manifest Store]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_determining_revocation_through_ocsp_responses_in_the_c2pa_manifest_store
+fn responder_is_authorized(
+    ocsp_cert_chain: &[Vec<u8>],
+    responder_der: &[u8],
+    signing_cert_chain: &[Vec<u8>],
+    ctp: &CertificateTrustPolicy,
+    signing_time_epoch: Option<i64>,
+) -> bool {
+    if let Some(issuer_der) = signing_cert_chain.get(1) {
+        if responder_der == issuer_der.as_slice() {
+            return true;
+        }
+        // A designated responder: chains to the issuing CA as its only anchor.
+        let mut issuer_policy = CertificateTrustPolicy::new();
+        issuer_policy.clear_ekus();
+        issuer_policy.add_valid_ekus(OCSP_OID_STR.as_bytes());
+        if issuer_policy
+            .add_trust_anchors(der_to_pem(issuer_der).as_bytes())
+            .is_ok()
+            && issuer_policy
+                .check_certificate_trust(ocsp_cert_chain, responder_der, signing_time_epoch)
+                .is_ok()
+        {
+            return true;
+        }
+    }
+    ctp.check_certificate_trust(ocsp_cert_chain, responder_der, signing_time_epoch)
+        .is_ok()
+}
+
+/// One DER certificate as a PEM block, for `CertificateTrustPolicy::add_trust_anchors`.
+fn der_to_pem(der: &[u8]) -> String {
+    let b64 = crate::crypto::base64::encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
 
 /// Extends the certificates embedded in an OCSP response with the signer's
